@@ -2,10 +2,10 @@
  * Copyright 2014 Google Inc.
  * Author: willemb@google.com (Willem de Bruijn)
  *
- * Conformance tests for MSG_TSTAMP, including
+ * Conformance tests for software tx timestamping, including
  *
- * - UDP MSG_TSTAMP, MSG_TSTAMP_ENQ
- * - TCP MSG_TSTAMP, MSG_TSTAMP_ENQ and MSG_TSTAMP_ACK
+ * - SCHED, SND and ACK timestamps
+ * - RAW, UDP and TCP
  * - IPv4 and IPv6
  * - various packet sizes (to test GSO and TSO)
  *
@@ -15,7 +15,7 @@
  * This test requires a dummy TCP server.
  * A simple `nc6 [-u] -l -p $DESTPORT` will do
  *
- * Tested against Linux 3.16-rc1 (7171511eaec5)
+ * Tested against net-next (09ddb8e)
  *
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -46,6 +46,7 @@
 #include <netinet/udp.h>
 #include <netinet/tcp.h>
 #include <netpacket/packet.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -62,19 +63,20 @@
 #define MSG_TSTAMP	0x100000
 #define MSG_TSTAMP_ACK	0x200000
 #define MSG_TSTAMP_ENQ	0x400000
+#define MSG_TSTAMP_ANY	(MSG_TSTAMP | MSG_TSTAMP_ACK | MSG_TSTAMP_ENQ)
 
 #ifndef SCM_TSTAMP_SND
 struct scm_timestamping {
 	struct timespec ts[3];
 };
 
-#define SCM_TSTAMP_SND		0x1	/* driver passed skb to NIC */
-#define SCM_TSTAMP_ACK		0x2	/* transport layer saw ACK */
-#define SCM_TSTAMP_ENQ		0x4	/* stack passed skb to TC layer */
-#endif
+#define SCM_TSTAMP_SND		0
+#define SCM_TSTAMP_SCHED	1
+#define SCM_TSTAMP_ACK		2
 
-#ifndef SOF_TIMESTAMPING_OPT_TSONLY
-#define SOF_TIMESTAMPING_OPT_TSONLY	(1<<7)
+#define SOF_TIMESTAMPING_OPT_ID		(1<<7)
+#define SOF_TIMESTAMPING_TX_SCHED	(1<<8)
+#define SOF_TIMESTAMPING_TX_ACK		(1<<9)
 #endif
 
 #define NUM_RUNS	4
@@ -137,7 +139,7 @@ static void print_timestamp(struct scm_timestamping *tss, int tstype, int tskey)
 	const char *tsname;
 
 	switch (tstype) {
-	case SCM_TSTAMP_ENQ:
+	case SCM_TSTAMP_SCHED:
 		tsname = "  ENQ";
 		break;
 	case SCM_TSTAMP_SND:
@@ -151,6 +153,19 @@ static void print_timestamp(struct scm_timestamping *tss, int tstype, int tskey)
 		tstype);
 	}
 	__print_timestamp(tsname, &tss->ts[0], tskey);
+}
+
+static void __poll(int fd)
+{
+	struct pollfd pollfd;
+	int ret;
+
+	memset(&pollfd, 0, sizeof(pollfd));
+	pollfd.events = POLLIN;
+	pollfd.fd = fd;
+	ret = poll(&pollfd, 1, 100);
+	if (ret == -1 && errno != EAGAIN)
+		error(1, errno, "poll");
 }
 
 static void __recv_errmsg_cmsg(struct msghdr *msg)
@@ -182,7 +197,7 @@ static void __recv_errmsg_cmsg(struct msghdr *msg)
 	}
 
 	if (serr && tss)
-		print_timestamp(tss, serr->ee_info & 0x3FF, serr->ee_data);
+		print_timestamp(tss, serr->ee_info, serr->ee_data);
 }
 
 static int recv_errmsg(int fd)
@@ -231,6 +246,36 @@ done:
 	return ret == -1;
 }
 
+static int setsockopt_ts(int fd, int flags)
+{
+	int val;
+
+	val = 0;
+	if (flags & MSG_TSTAMP_ANY) {
+		if (flags & MSG_TSTAMP)
+			val |= SOF_TIMESTAMPING_TX_SOFTWARE;
+		if (flags & MSG_TSTAMP_ENQ)
+			val |= SOF_TIMESTAMPING_TX_SCHED;
+		if (flags & MSG_TSTAMP_ACK)
+			val |= SOF_TIMESTAMPING_TX_ACK;
+
+		val |= SOF_TIMESTAMPING_OPT_ID;
+
+		flags &= ~MSG_TSTAMP_ANY;
+	}
+
+#if 0
+	if (tstamp_no_payload)
+		val |= SOF_TIMESTAMPING_OPT_TX_NO_PAYLOAD;
+#endif
+
+	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING,
+		       (char *) &val, sizeof(val)))
+		error(1, 0, "setsockopt");
+
+	return flags;
+}
+
 static void do_test(int family, unsigned int flags)
 {
 	char *buf;
@@ -272,12 +317,7 @@ static void do_test(int family, unsigned int flags)
 		}
 	}
 
-	if (tstamp_no_payload) {
-		val = SOF_TIMESTAMPING_OPT_TSONLY;
-		if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING,
-			       (char *) &val, sizeof(val)))
-			error(1, 0, "setsockopt no payload");
-	}
+	flags = setsockopt_ts(fd, flags);
 
 	for (i = 0; i < NUM_RUNS; i++) {
 		memset(&ts_prev, 0, sizeof(ts_prev));
@@ -326,6 +366,9 @@ static void do_test(int family, unsigned int flags)
 		usleep(50 * 1000);
 
 		print_timestamp_usr();
+
+		usleep(100);	// to handle bug where poll fails
+		__poll(fd);
 		while (!recv_errmsg(fd)) {}
 	}
 
