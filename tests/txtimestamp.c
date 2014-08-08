@@ -367,7 +367,6 @@ static void do_test(int family, unsigned int flags)
 
 		print_timestamp_usr();
 
-		usleep(100);	// to handle bug where poll fails
 		__poll(fd);
 		while (!recv_errmsg(fd)) {}
 	}
