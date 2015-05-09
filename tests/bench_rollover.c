@@ -45,6 +45,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define MAX_NUM_SOCK	64
 #define DFLT_NUM_SOCK	8
 
 #define RING_NUM_FRAMES 1024
@@ -125,25 +126,20 @@ static char *setrxring(int fd)
 	return ring;
 }
 
-int reader(int cpu, int fd)
+int reader(int cpu, int fd, char *ring)
 {
 	struct tpacket2_hdr *hdr;
 	struct tpacket_stats tpstats;
 	struct tpacket_rollover_stats rstats;
 	struct pollfd pfd;
-	char buf[ETH_FRAME_LEN], *ring = NULL;
+	char buf[ETH_FRAME_LEN];
 	unsigned long packets = 0;
 	socklen_t slen;
 	int ret, index = 0;
 
 	setcpu(cpu);
 
-	if (cfg_use_ring) {
-		ring = setrxring(fd);
-		hdr = (void *) ring;
-		memset(ring, 0, RING_NUM_FRAMES * RING_FRAME_LEN);
-	}
-
+	hdr = (void *) ring;
 	while (!do_stop) {
 		if (ring) {
 			int budget = RING_NUM_FRAMES;
@@ -207,6 +203,9 @@ int reader(int cpu, int fd)
 				rstats.tp_failed);
 	}
 
+	if (ring && munmap(ring, RING_FRAME_LEN * RING_NUM_FRAMES))
+		error(1, errno, "munmap.%d", cpu);
+
 	if (close(fd))
 		error(1, errno, "close.%d", cpu);
 
@@ -235,6 +234,8 @@ static void parse_opt(int argc, char **argv)
 			break;
 		case 'n':
 			cfg_num_sock = strtoul(optarg, NULL, 10);
+			if (cfg_num_sock > MAX_NUM_SOCK)
+				error(1, 0, "num exceeds %u\n", MAX_NUM_SOCK);
 			break;
 		case 'r':
 			cfg_use_ring = true;
@@ -263,9 +264,11 @@ static void parse_opt(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
+	static int fds[MAX_NUM_SOCK];
+	static char *rings[MAX_NUM_SOCK];
 	struct sigaction sig = {};
 	pid_t pid, pgid;
-	int i, fd, val;
+	int i, val;
 
 	parse_opt(argc, argv);
 
@@ -277,22 +280,29 @@ int main(int argc, char **argv)
 		error(1, errno, "sigaction");
 
 	for (i = 0; i < cfg_num_sock; i++) {
-		fd = socket(PF_PACKET, SOCK_RAW, 0);
-		if (fd == -1)
+		fds[i] = socket(PF_PACKET, SOCK_RAW, 0);
+		if (fds[i] == -1)
 			error(1, errno, "socket.%d", i);
 
-		bindtodev(i, fd, "eth0");
+		bindtodev(i, fds[i], "eth0");
+
+		if (cfg_use_ring) {
+			rings[i] = setrxring(fds[i]);
+			memset(rings[i], 0, RING_NUM_FRAMES * RING_FRAME_LEN);
+		}
 
 		val = PACKET_FANOUT_CPU | PACKET_FANOUT_FLAG_ROLLOVER;
 		val <<= 16;
-		if (setsockopt(fd, SOL_PACKET, PACKET_FANOUT,
+		if (setsockopt(fds[i], SOL_PACKET, PACKET_FANOUT,
 			       &val, sizeof(val)));
+	}
 
+	for (i = 0; i < cfg_num_sock; i++) {
 		pid = fork();
 		if (pid == -1)
 			error(1, errno, "fork.%d", i);
 		if (!pid)
-			return reader(i, fd);
+			return reader(i, fds[i], rings[i]);
 	}
 
 	fprintf(stderr, "Press [Enter] to exit\n");
