@@ -25,8 +25,10 @@
 #include <errno.h>
 #include <error.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <linux/filter.h>
 #include <linux/if_packet.h>
+#include <linux/types.h>
 #include <net/if.h>
 #include <net/ethernet.h>
 #include <netinet/ip.h>
@@ -55,9 +57,9 @@
 #define PACKET_ROLLOVER_STATS	21
 
 struct tpacket_rollover_stats {
-	unsigned long tp_all;
-	unsigned long tp_huge;
-	unsigned long tp_failed;
+	__aligned_u64	tp_all;
+	__aligned_u64	tp_huge;
+	__aligned_u64	tp_failed;
 };
 #endif
 
@@ -194,13 +196,13 @@ int reader(int cpu, int fd, char *ring)
 
 	if (packets) {
 		usleep(cpu * 4000);	/* poor man's sorting */
-		fprintf(stderr, "%3d %10lu %10u %10u %10lu %10lu %10lu\n",
+		fprintf(stderr, "%3d %10lu %10u %10u %10" PRIu64 " %10" PRIu64 " %10" PRIu64 "\n",
 				cpu, packets,
 				tpstats.tp_packets - tpstats.tp_drops,
 				tpstats.tp_drops,
-				rstats.tp_all,
-				rstats.tp_huge,
-				rstats.tp_failed);
+				(uint64_t) rstats.tp_all,
+				(uint64_t) rstats.tp_huge,
+				(uint64_t) rstats.tp_failed);
 	}
 
 	if (ring && munmap(ring, RING_FRAME_LEN * RING_NUM_FRAMES))
