@@ -7,6 +7,8 @@
 #include <error.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <linux/capability.h>
 #include <linux/filter.h>
 #include <linux/if_packet.h>
 #include <linux/virtio_net.h>
@@ -28,12 +30,18 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifndef PACKET_QDISC_BYPASS
+#define PACKET_QDISC_BYPASS	20
+#endif
+
 static bool cfg_enable_ring = true;
 static bool cfg_enable_vnet = false;
 static char *cfg_ifname = "eth0";
 static int cfg_ifindex;
-static int cfg_num_frames = 3;
-static int cfg_payload_len = 500;
+static int cfg_num_frames = 4;
+static unsigned int cfg_override_len = UINT_MAX;
+static unsigned int cfg_payload_len = 500;
+static bool cfg_qdisc_bypass = false;
 
 static struct tpacket_req req;
 static struct in_addr ip_saddr, ip_daddr;
@@ -54,6 +62,13 @@ static int socket_open(void)
 	if (setsockopt(fd, SOL_PACKET, PACKET_VERSION, &val, sizeof(val)))
 		error(1, errno, "setsockopt version");
 
+	if (cfg_qdisc_bypass) {
+		val = 1;
+		if (setsockopt(fd, SOL_PACKET, PACKET_QDISC_BYPASS,
+			       &val, sizeof(val)))
+			error(1, errno, "setsockopt qdisc bypass");
+	}
+
 	if (cfg_enable_vnet) {
 		val = 1;
 		if (setsockopt(fd, SOL_PACKET, PACKET_VNET_HDR,
@@ -67,8 +82,16 @@ static int socket_open(void)
 static char * ring_open(int fd)
 {
 	char *ring;
-	
-	req.tp_frame_size = getpagesize() << 1;
+	unsigned int frame_sz;
+
+	frame_sz = cfg_payload_len + 100 /* overestimate */;
+	frame_sz = 1 << (32 - __builtin_clz(frame_sz));
+	if (frame_sz < getpagesize())
+		frame_sz = getpagesize();
+
+	fprintf(stderr, "frame size: %u\n", frame_sz);
+
+	req.tp_frame_size = frame_sz;
 	req.tp_frame_nr   = cfg_num_frames;
 	req.tp_block_size = req.tp_frame_size;
 	req.tp_block_nr   = cfg_num_frames;
@@ -182,14 +205,19 @@ static int frame_fill(void *buffer, unsigned int payload_len)
 static void ring_write(void *slot)
 {
 	struct tpacket2_hdr *header = slot;
+	int len;
 
 	if (header->tp_status != TP_STATUS_AVAILABLE)
 		error(1, 0, "write: slot not available");
 
 	memset(slot + TPACKET2_HDRLEN, 0, req.tp_frame_size - TPACKET2_HDRLEN);
 
+	len = frame_fill(slot + header->tp_mac, cfg_payload_len);
+	if (cfg_override_len < len)
+		len = cfg_override_len;
+
 	header->tp_mac = TPACKET2_HDRLEN - sizeof(struct sockaddr_ll);
-	header->tp_len = frame_fill(slot + header->tp_mac, cfg_payload_len);
+	header->tp_len = len;
 	header->tp_status = TP_STATUS_SEND_REQUEST;
 }
 
@@ -200,6 +228,10 @@ static void socket_write(int fd)
 
 	memset(buf, 0, sizeof(buf));
 	len = frame_fill(buf, cfg_payload_len);
+
+	if (cfg_override_len < len)
+		len = cfg_override_len;
+
 	ret = send(fd, buf, len, 0);
 	if (ret == -1)
 		error(1, errno, "send");
@@ -257,13 +289,42 @@ static void do_run(int fd)
 		socket_write(fd);
 }
 
+static void drop_capability(uint32_t capability)
+{
+	struct __user_cap_header_struct hdr = {};
+	struct __user_cap_data_struct data = {};
+
+	hdr.pid = getpid();
+	hdr.version = _LINUX_CAPABILITY_VERSION;
+
+	if (capget(&hdr, &data) == -1)
+		error(1, errno, "capget");
+	fprintf(stderr, "cap.1: eff=0x%x perm=0x%x\n",
+			data.effective, data.permitted);
+
+	data.effective &= ~CAP_TO_MASK(capability);
+	data.permitted &= ~CAP_TO_MASK(capability);
+	data.inheritable = 0;
+
+	if (capset(&hdr, &data) == -1)
+		error(1, errno, "capset");
+
+	if (capget(&hdr, &data) == -1)
+		error(1, errno, "capget");
+	fprintf(stderr, "cap.2: eff=0x%x perm=0x%x\n",
+			data.effective, data.permitted);
+}
+
 static void parse_opts(int argc, char **argv)
 {
 	int c;
 
-	while ((c = getopt(argc, argv, "d:vi:l:ns:")) != -1)
+	while ((c = getopt(argc, argv, "cd:i:l:L:n:Nqs:v")) != -1)
 	{
 		switch (c) {
+		case 'c':
+			drop_capability(CAP_SYS_RAWIO);
+			break;
 		case 'd':
 			if (!inet_aton(optarg, &ip_daddr))
 				error(1, 0, "bad ipv4 destination address");
@@ -274,8 +335,17 @@ static void parse_opts(int argc, char **argv)
 		case 'l':
 			cfg_payload_len = strtoul(optarg, NULL, 0);
 			break;
+		case 'L':
+			cfg_override_len = strtoul(optarg, NULL, 0);
+			break;
 		case 'n':
+			cfg_num_frames = strtoul(optarg, NULL, 0);
+			break;
+		case 'N':
 			cfg_enable_ring = false;
+			break;
+		case 'q':
+			cfg_qdisc_bypass = true;
 			break;
 		case 's':
 			if (!inet_aton(optarg, &ip_saddr))
@@ -295,6 +365,10 @@ static void parse_opts(int argc, char **argv)
 	cfg_ifindex = if_nametoindex(cfg_ifname);
 	if (!cfg_ifindex)
 		error(1, errno, "ifnametoindex");
+
+	fprintf(stderr, "len:  %u\n", cfg_num_frames);
+	fprintf(stderr, "num:  %u\n", cfg_payload_len);
+	fprintf(stderr, "vnet: %sabled\n", cfg_enable_vnet ? "en" : "dis");
 }
 
 int main(int argc, char **argv)
@@ -303,8 +377,6 @@ int main(int argc, char **argv)
 	int fd;
 
 	parse_opts(argc, argv);
-
-	fprintf(stderr, "vnet: %sabled\n", cfg_enable_vnet ? "en" : "dis");
 
 	fd = socket_open();
 	socket_bind(fd);
