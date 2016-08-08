@@ -198,7 +198,7 @@ log_show(void)
 }
 
 /* From "The Practice of Programming" via
- * PERL_HASH in Perl 5.005, which is GPLv1 */
+ * PERL_HASH in Perl 5.005, which is GPL */
 static int hash_compute(void *_key, int klen)
 {
 	const unsigned int multiplier = 37;

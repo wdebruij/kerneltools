@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Google Inc. All Rights Reserved.
+ * Copyright 2014 Google Inc.
  * Author: willemb@google.com (Willem de Bruijn)
  *
  * Netlink support library
@@ -15,7 +15,22 @@
  * or even
  *   `iptables -A OUTPUT -m time -j NFLOG --nflog-group=10`
  *
- * TODO(willemb): optimize by using mmapped ring.
+ * TODO: optimize by using mmapped ring, similar to psock
+ *
+ * License (GPLv2):
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. * See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
 #define _GNU_SOURCE
@@ -82,7 +97,7 @@ static void __nflog_sendcmd(int fd, uint8_t cmd, void *msg, int msglen,
   if (send(fd, buf, nh->nlmsg_len, 0) != nh->nlmsg_len)
     error(1, errno, "sendcmd");
 
-  /* TODO(willemb): handle EINTR */
+  /* TODO: handle EINTR */
   ret = recv(fd, buf, sizeof(buf), 0);
   if (ret == -1)
     error(1, errno, "recv ctrl: sock error");
