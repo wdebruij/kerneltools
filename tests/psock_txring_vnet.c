@@ -30,12 +30,21 @@
 #include <string.h>
 #include <unistd.h>
 
+#if 0
+/* requires libcap-dev */
+#include <sys/capability.h>
+#else
+extern int capset(cap_user_header_t header, cap_user_data_t data);
+extern int capget(cap_user_header_t header, const cap_user_data_t data);
+#endif
+
 #ifndef PACKET_QDISC_BYPASS
 #define PACKET_QDISC_BYPASS	20
 #endif
 
 static bool cfg_enable_ring = true;
 static bool cfg_enable_vnet = false;
+static bool cfg_enable_gso = true;
 static char *cfg_ifname = "eth0";
 static int cfg_ifindex;
 static int cfg_num_frames = 4;
@@ -160,15 +169,17 @@ static int frame_fill(void *buffer, unsigned int payload_len)
 
 		vnet = buffer;
 
-		vnet->hdr_len = ETH_HLEN + sizeof(*iph) + sizeof(*tcph);
-
 		vnet->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
 		vnet->csum_start = ETH_HLEN + sizeof(*iph);
 		vnet->csum_offset = __builtin_offsetof(struct tcphdr, check);
 
-		vnet->gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
-		vnet->gso_size = ETH_DATA_LEN - sizeof(struct iphdr) -
-						sizeof(struct tcphdr);
+		if (cfg_enable_gso) {
+			vnet->hdr_len = ETH_HLEN + sizeof(*iph) + sizeof(*tcph);
+			vnet->gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
+			vnet->gso_size = ETH_DATA_LEN - sizeof(struct iphdr) -
+							sizeof(struct tcphdr);
+		}
+
 		off += sizeof(*vnet); 
 	}
 
@@ -319,7 +330,7 @@ static void parse_opts(int argc, char **argv)
 {
 	int c;
 
-	while ((c = getopt(argc, argv, "cd:i:l:L:n:Nqs:v")) != -1)
+	while ((c = getopt(argc, argv, "cd:Gi:l:L:n:Nqs:v")) != -1)
 	{
 		switch (c) {
 		case 'c':
@@ -328,6 +339,10 @@ static void parse_opts(int argc, char **argv)
 		case 'd':
 			if (!inet_aton(optarg, &ip_daddr))
 				error(1, 0, "bad ipv4 destination address");
+			break;
+		case 'G':
+			fprintf(stderr, "gso disabled (-v only sets csum)\n");
+			cfg_enable_gso = false;
 			break;
 		case 'i':
 			cfg_ifname = optarg;
