@@ -221,13 +221,13 @@ static void ring_write(void *slot)
 	if (header->tp_status != TP_STATUS_AVAILABLE)
 		error(1, 0, "write: slot not available");
 
-	memset(slot + TPACKET2_HDRLEN, 0, req.tp_frame_size - TPACKET2_HDRLEN);
+	header->tp_mac = TPACKET2_HDRLEN - sizeof(struct sockaddr_ll);
+	memset(slot + header->tp_mac, 0, req.tp_frame_size - header->tp_mac);
 
 	len = frame_fill(slot + header->tp_mac, cfg_payload_len);
 	if (cfg_override_len < len)
 		len = cfg_override_len;
 
-	header->tp_mac = TPACKET2_HDRLEN - sizeof(struct sockaddr_ll);
 	header->tp_len = len;
 	header->tp_status = TP_STATUS_SEND_REQUEST;
 }
