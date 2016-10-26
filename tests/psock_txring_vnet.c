@@ -44,7 +44,8 @@ extern int capget(cap_user_header_t header, const cap_user_data_t data);
 
 static bool cfg_enable_ring = true;
 static bool cfg_enable_vnet = false;
-static bool cfg_enable_gso = true;
+static bool cfg_enable_csum = true;	/* only used if cfg_enable_vnet */
+static bool cfg_enable_gso = true;	/* only used if cfg_enable_vnet */
 static char *cfg_ifname = "eth0";
 static int cfg_ifindex;
 static int cfg_num_frames = 4;
@@ -176,15 +177,19 @@ static int frame_fill(void *buffer, unsigned int payload_len)
 
 		vnet = buffer;
 
-		vnet->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
-		vnet->csum_start = ETH_HLEN + sizeof(*iph);
-		vnet->csum_offset = __builtin_offsetof(struct tcphdr, check);
+		if (cfg_enable_csum) {
+			vnet->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+			vnet->csum_start = ETH_HLEN + sizeof(*iph);
+			vnet->csum_offset = __builtin_offsetof(struct tcphdr, check);
+		}
 
 		if (cfg_enable_gso) {
 			vnet->hdr_len = ETH_HLEN + sizeof(*iph) + sizeof(*tcph);
 			vnet->gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
 			vnet->gso_size = ETH_DATA_LEN - sizeof(struct iphdr) -
 							sizeof(struct tcphdr);
+		} else {
+			vnet->gso_type = VIRTIO_NET_HDR_GSO_NONE;
 		}
 
 		off += sizeof(*vnet); 
@@ -337,18 +342,20 @@ static void parse_opts(int argc, char **argv)
 {
 	int c;
 
-	while ((c = getopt(argc, argv, "cd:Gi:l:L:n:Nqs:v")) != -1)
+	while ((c = getopt(argc, argv, "cCd:Gi:l:L:n:Nqs:v")) != -1)
 	{
 		switch (c) {
 		case 'c':
 			drop_capability(CAP_SYS_RAWIO);
+			break;
+		case 'C':
+			cfg_enable_csum = false;
 			break;
 		case 'd':
 			if (!inet_aton(optarg, &ip_daddr))
 				error(1, 0, "bad ipv4 destination address");
 			break;
 		case 'G':
-			fprintf(stderr, "gso disabled (-v only sets csum)\n");
 			cfg_enable_gso = false;
 			break;
 		case 'i':
