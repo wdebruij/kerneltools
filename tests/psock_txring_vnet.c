@@ -129,15 +129,21 @@ static unsigned long add_csum_hword(const uint16_t *start, int num_u16)
 	return sum;
 }
 
-static uint16_t build_ip_csum(const uint16_t *start, int num_u16,
-			      unsigned long sum)
+static uint16_t add_csum_hword_fold(const uint16_t *start, int num_u16,
+				    unsigned long sum)
 {
 	sum += add_csum_hword(start, num_u16);
 
 	while (sum >> 16)
 		sum = (sum & 0xffff) + (sum >> 16);
 
-	return ~sum;
+	return sum;
+}
+
+static uint16_t build_ip_csum(const uint16_t *start, int num_u16,
+			      unsigned long sum)
+{
+	return ~add_csum_hword_fold(start, num_u16, sum);
 }
 
 static uint16_t get_tcp_v4_csum(const struct iphdr *iph,
@@ -145,11 +151,12 @@ static uint16_t get_tcp_v4_csum(const struct iphdr *iph,
 				int length)
 {
 	unsigned long pseudo_sum = 0;
+	uint16_t proto = htons(IPPROTO_TCP);
+	uint16_t ulen = htons(length);
 
-	pseudo_sum += add_csum_hword((void *) &iph->saddr, 2);
-	pseudo_sum += add_csum_hword((void *) &iph->daddr, 2);
-	pseudo_sum += htons(IPPROTO_TCP);
-	pseudo_sum += htons(length);
+	pseudo_sum = add_csum_hword_fold((void *) &iph->saddr, 4, 0);
+	pseudo_sum = add_csum_hword_fold(&proto, 1, pseudo_sum);
+	pseudo_sum = add_csum_hword_fold(&ulen, 1, pseudo_sum);
 
 	if (cfg_enable_vnet)
 		return pseudo_sum;
