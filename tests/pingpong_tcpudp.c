@@ -51,9 +51,9 @@ static unsigned long gettimeofday_us(void)
 	return (1000UL * 1000 * tv.tv_sec) + tv.tv_usec;
 }
 
-static uint16_t calc_csum(const uint32_t pseudo, const uint16_t *data, int num_words)
+static uint16_t calc_csum(unsigned long sum, const uint16_t *data,
+			  int num_words)
 {
-	unsigned long sum = pseudo;
 	int i;
 
 	for (i = 0; i < num_words; i++)
@@ -63,6 +63,22 @@ static uint16_t calc_csum(const uint32_t pseudo, const uint16_t *data, int num_w
 		sum = (sum & 0xffff) + (sum >> 16);
 
 	return ~sum;
+}
+
+static uint16_t calc_tcp_csum(struct iphdr *iph, struct tcphdr *tcph)
+{
+	unsigned long sum = 0, tcplen;
+
+	tcplen = ntohs(iph->tot_len) - sizeof(*iph);
+	if (tcplen & 1)
+		error(1, 0, "odd length: csum needs padding");
+
+	sum += iph->daddr;
+	sum += iph->saddr;
+	sum += htons(iph->protocol);
+	sum += htons(tcplen);
+
+	return calc_csum(sum, (void *) tcph, tcplen >> 1);
 }
 
 static void build_pkt(void)
@@ -116,11 +132,9 @@ static void build_pkt(void)
 			tcph->ack = 1;
 		tcph->psh = 1;
 		tcph->window = htons(16000);
-		tcph->check = htons(0xd1e2);
+		tcph->check = calc_tcp_csum(iph, tcph);
 		off += sizeof(*tcph);
 	}
-
-	memset(packet + off, 'a', cfg_payload_len);
 }
 
 static void do_recv(int fd)
