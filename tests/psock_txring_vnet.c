@@ -46,6 +46,7 @@ static bool cfg_enable_ring = true;
 static bool cfg_enable_vnet = false;
 static bool cfg_enable_csum = true;	/* only used if cfg_enable_vnet */
 static bool cfg_enable_gso = true;	/* only used if cfg_enable_vnet */
+static bool cfg_vector_send = false;	
 static char *cfg_ifname = "eth0";
 static int cfg_ifindex;
 static int cfg_num_frames = 4;
@@ -68,9 +69,11 @@ static int socket_open(void)
 	if (fd == -1)
 		error(1, errno, "socket");
 
-	val = TPACKET_V2;
-	if (setsockopt(fd, SOL_PACKET, PACKET_VERSION, &val, sizeof(val)))
-		error(1, errno, "setsockopt version");
+	if (cfg_enable_ring)  {
+		val = TPACKET_V2;
+		if (setsockopt(fd, SOL_PACKET, PACKET_VERSION, &val, sizeof(val)))
+			error(1, errno, "setsockopt version");
+	}
 
 	if (cfg_qdisc_bypass) {
 		val = 1;
@@ -165,35 +168,31 @@ static uint16_t get_tcp_v4_csum(const struct iphdr *iph,
 		return build_ip_csum((void *) tcph, length >> 1, pseudo_sum);
 }
 
-static int frame_fill(void *buffer, unsigned int payload_len)
+static void set_vheader(void *buffer)
+{
+	struct virtio_net_hdr *vnet;
+	vnet = buffer;
+	if (cfg_enable_csum) {
+		vnet->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+		vnet->csum_start = ETH_HLEN + sizeof(struct iphdr);
+		vnet->csum_offset = __builtin_offsetof(struct tcphdr, check);
+	}
+
+	if (cfg_enable_gso) {
+		vnet->hdr_len = ETH_HLEN + sizeof(struct iphdr) + sizeof(struct tcphdr);
+		vnet->gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
+		vnet->gso_size = ETH_DATA_LEN - sizeof(struct iphdr) -
+						sizeof(struct tcphdr);
+	} else {
+		vnet->gso_type = VIRTIO_NET_HDR_GSO_NONE;
+	}
+}
+
+static int set_packet(void *buffer, unsigned int off, unsigned int payload_len)
 {
 	struct ethhdr *eth;
 	struct iphdr *iph;
 	struct tcphdr *tcph;
-	int off = 0;
-
-	if (cfg_enable_vnet) {
-		struct virtio_net_hdr *vnet;
-
-		vnet = buffer;
-
-		if (cfg_enable_csum) {
-			vnet->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
-			vnet->csum_start = ETH_HLEN + sizeof(*iph);
-			vnet->csum_offset = __builtin_offsetof(struct tcphdr, check);
-		}
-
-		if (cfg_enable_gso) {
-			vnet->hdr_len = ETH_HLEN + sizeof(*iph) + sizeof(*tcph);
-			vnet->gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
-			vnet->gso_size = ETH_DATA_LEN - sizeof(struct iphdr) -
-							sizeof(struct tcphdr);
-		} else {
-			vnet->gso_type = VIRTIO_NET_HDR_GSO_NONE;
-		}
-
-		off += sizeof(*vnet); 
-	}
 
 	eth = buffer + off;
 	memcpy(&eth->h_source, cfg_mac_src, ETH_ALEN);
@@ -223,6 +222,21 @@ static int frame_fill(void *buffer, unsigned int payload_len)
 	tcph->check	= get_tcp_v4_csum(iph, tcph,
 					  (sizeof(*tcph) + payload_len));
 	return off + payload_len;
+}
+
+static int frame_fill(void *buffer, unsigned int payload_len)
+{
+	struct ethhdr *eth;
+	struct iphdr *iph;
+	struct tcphdr *tcph;
+	int off = 0;
+
+	if (cfg_enable_vnet) {
+		set_vheader(buffer);
+		off += sizeof(struct virtio_net_hdr);
+	}
+
+	return set_packet(buffer, off, payload_len);
 }
 
 static void ring_write(void *slot)
@@ -260,6 +274,69 @@ static void socket_write(int fd)
 		error(1, errno, "send");
 	if (ret < len)
 		error(1, 0, "send: %uB < %uB\n", ret, len);
+}
+
+static void vector_write(int fd, int count)
+{
+	struct mmsghdr *loop, *msgvec = NULL;
+	struct iovec *iov = NULL;
+	int i, ret;
+	char *packet;
+
+	fprintf(stderr, "vector size: %u\n", count);
+	msgvec = malloc(sizeof(struct mmsghdr) * count);
+	if (msgvec == NULL) {
+		error(1, ENOMEM, "alloc mmsg vector");
+	}
+	iov = malloc(sizeof(struct iovec) * count * 3);
+	if (iov == NULL) {
+		error(1, ENOMEM, "alloc iov vector");
+	}
+	loop = msgvec;
+	for (i = 0; i < count ; i++) {
+		loop->msg_hdr.msg_iov = iov;
+		loop->msg_hdr.msg_iovlen = 2;
+		loop->msg_hdr.msg_control = NULL;
+		loop->msg_hdr.msg_controllen = 0;
+		loop->msg_hdr.msg_flags = MSG_DONTWAIT;
+		loop->msg_hdr.msg_name = NULL;
+		loop->msg_hdr.msg_namelen = 0;
+		if (cfg_enable_vnet) {
+			loop->msg_hdr.msg_iovlen += 1;
+			iov->iov_base = malloc(sizeof (struct virtio_net_hdr));
+			if (iov->iov_base == NULL) {
+				error(1, ENOMEM, "alloc vnet hdr");
+				iov->iov_len = 0;
+			} else {
+				iov->iov_len = sizeof(struct virtio_net_hdr);
+				set_vheader(iov->iov_base);
+			}
+			iov++;
+		} 
+		packet = malloc(
+			cfg_payload_len + sizeof(struct ethhdr)
+			+ sizeof(struct iphdr) + sizeof(struct tcphdr));
+		if (packet == NULL) {
+			error(1, ENOMEM, "alloc payload");
+			iov->iov_len = 0;
+		} else {
+			set_packet(packet, 0, cfg_payload_len);
+			iov->iov_base = packet;
+			iov->iov_len = sizeof(struct ethhdr)
+				+ sizeof(struct iphdr) + sizeof(struct tcphdr);
+			iov++;
+			iov->iov_base = packet + sizeof(struct ethhdr)
+				+ sizeof(struct iphdr) + sizeof(struct tcphdr);
+			iov->iov_len = cfg_payload_len;
+		}
+		iov++;
+		loop++;
+	}
+	ret = sendmmsg(fd, msgvec, count, 0);
+	if (ret == -1)
+		error(1, errno, "send");
+	if (ret < count)
+		error(1, 0, "send: %uB < %uB\n", ret, count);
 }
 
 static void socket_bind(int fd)
@@ -342,7 +419,7 @@ static void parse_opts(int argc, char **argv)
 {
 	int c;
 
-	while ((c = getopt(argc, argv, "cCd:Gi:l:L:n:Nqs:v")) != -1)
+	while ((c = getopt(argc, argv, "cCd:Gi:l:L:n:Nqs:vZ")) != -1)
 	{
 		switch (c) {
 		case 'c':
@@ -383,6 +460,12 @@ static void parse_opts(int argc, char **argv)
 		case 'v':
 			cfg_enable_vnet = true;
 			break;
+		case 'Z':
+            {
+                cfg_enable_ring = false;
+                cfg_vector_send = true;
+            }
+			break;
 		default:
 			error(1, 0, "unknown option %c", c);
 		}
@@ -415,7 +498,10 @@ int main(int argc, char **argv)
 		do_run_ring(fd, ring);
 		ring_close(ring);
 	} else {
-		do_run(fd);
+		if (cfg_vector_send) {
+			vector_write(fd, cfg_num_frames);
+		} else
+			do_run(fd);
 	}
 
 	if (close(fd) == -1)
