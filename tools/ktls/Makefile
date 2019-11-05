@@ -30,8 +30,18 @@ test_ktls:
 	sleep 0.2
 	echo a | socat stdio openssl-connect:localhost:443,pf=ip6,cert=test.pem,cafile=test.cert
 
+test_ktls_splice:
+	./ktls -k -s &
+	sleep 0.2
+	echo a | socat stdio openssl-connect:localhost:443,pf=ip6,cert=test.pem,cafile=test.cert
+
 test_ktls_verbose:
 	./ktls -k &
+	sleep 0.2
+	echo a | openssl s_client -connect localhost:443 -CAfile test.cert
+
+test_ktls_splice_verbose:
+	./ktls -k -s &
 	sleep 0.2
 	echo a | openssl s_client -connect localhost:443 -CAfile test.cert
 

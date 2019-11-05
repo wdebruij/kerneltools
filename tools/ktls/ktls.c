@@ -63,6 +63,7 @@ typedef struct {
 #endif
 
 static bool cfg_do_ktls;
+static bool cfg_do_splice;
 
 static void error_ssl(void)
 {
@@ -165,16 +166,21 @@ static void setup_kernel_tls(SSL *ssl, int fd, bool is_tx)
 		error(1, errno, "setsockopt tls %cx", is_tx ? 't' : 'r');
 }
 
-static void readwrite_kernel_tls(SSL *ssl, int fd)
+static void __setup_kernel_tls(SSL *ssl, int fd)
 {
-	char msg[100];
-	int ret;
-
 	if (setsockopt(fd, IPPROTO_TCP, TCP_ULP, "tls", sizeof("tls")))
 		error(1, errno, "setsockopt upper layer protocol");
 
 	setup_kernel_tls(ssl, fd, true);
 	setup_kernel_tls(ssl, fd, false);
+}
+
+static void readwrite_kernel_tls(SSL *ssl, int fd)
+{
+	char msg[100];
+	int ret;
+
+	__setup_kernel_tls(ssl, fd);
 
 	ret = read(fd, &msg, sizeof(msg));
 	if (ret == -1)
@@ -190,24 +196,60 @@ static void readwrite_kernel_tls(SSL *ssl, int fd)
 	printf("sent: %c (kTLS)\n", msg[0]);
 }
 
+/* use splice instead of read() plus write()
+ * cannot splice from fd to itself, so use intermediate pipe
+ */
+static void splice_kernel_tls(SSL *ssl, int fd)
+{
+	int ret, pipes[2];
+
+	__setup_kernel_tls(ssl, fd);
+
+	if (pipe(pipes))
+		error(1, errno, "pipe");
+
+	ret = splice(fd, NULL, pipes[1], NULL, 100, 0);
+	if (ret == -1)
+		error(1, errno, "splice from");
+	if (ret == 0)
+		error(1, errno, "splice from: no data");
+
+	printf("splice: %dB (kTLS) (from)\n", ret);
+
+	ret = splice(pipes[0], NULL, fd, NULL, ret, 0);
+	if (ret == -1)
+		error(1, errno, "splice to");
+	if (ret == 0)
+		error(1, errno, "splice to: no data");
+
+	printf("splice: %dB (kTLS) (to)\n", ret);
+
+}
+
 static void usage(const char *filepath)
 {
-	error(1, 0, "usage: %s [-k]\n", filepath);
+	error(1, 0, "usage: %s [-k] [-s]\n", filepath);
 }
 
 static void parse_opts(int argc, char **argv)
 {
 	int c;
 
-	while ((c = getopt(argc, argv, "k")) != -1) {
+	while ((c = getopt(argc, argv, "ks")) != -1) {
 		switch (c) {
 		case 'k':
 			cfg_do_ktls = true;
+			break;
+		case 's':
+			cfg_do_splice = true;
 			break;
 		default:
 			usage(argv[0]);
 		}
 	}
+
+	if (cfg_do_splice && !cfg_do_ktls)
+		error(1, 0, "splice requires ktls");
 }
 
 int main(int argc, char **argv)
@@ -235,7 +277,9 @@ int main(int argc, char **argv)
 	if (SSL_accept(ssl) != 1)
 		error_ssl();
 
-	if (cfg_do_ktls)
+	if (cfg_do_splice)
+		splice_kernel_tls(ssl, fd);
+	else if (cfg_do_ktls)
 		readwrite_kernel_tls(ssl, fd);
 	else
 		readwrite_tls(ssl);
