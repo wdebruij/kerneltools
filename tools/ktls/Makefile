@@ -1,10 +1,13 @@
 
 .PHONY: all clean distclean test test_tls test_ktls test_tls_verbose test_ktls_verbose
 
-all: ktls test.pem
+all: ktls test.pem ktls_static
 
 ktls: ktls.o
 	gcc $+ -o $@ -l:libssl.so.1.0.2 -l:libcrypto.so.1.0.2 -lpthread -ldl
+
+ktls_static: ktls.o
+	gcc $+ -static -o $@ -lssl -lcrypto -lz -ldl -static-libgcc
 
 %.o: %.c
 	gcc -ggdb -c -Wall -Werror $< -o $@
@@ -52,4 +55,4 @@ clean:
 	-rm test.key test.cert test.pem
 
 distclean: clean
-	-rm -f ktls
+	-rm -f ktls ktls_static
