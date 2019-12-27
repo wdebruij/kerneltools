@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
+#include <byteswap.h>
 #include <error.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -30,37 +31,6 @@
 #include <openssl/err.h>
 #include <openssl/aes.h>
 #include <openssl/modes.h>
-
-/* define some openssl internals */
-#ifndef EVP_AES_GCM_CTX
-typedef struct { uint64_t val[2]; } uint128_t;
-
-struct gcm128_context {
-	uint128_t Yi,EKi,EK0,len,Xi,H;
-	uint128_t Htable[16];
-	void *gmult;
-	void *ghash;
-	unsigned int mres, ares;
-	void *block;
-	void *key;
-};
-
-typedef struct {
-	union {
-		double align;	/* essential, see with pahole */
-		AES_KEY ks;
-	} ks;
-	int key_set;
-	int iv_set;
-	GCM128_CONTEXT gcm;
-	unsigned char *iv;
-	int ivlen;
-	int taglen;
-	int iv_gen;
-	int tls_aad_len;
-	ctr128_f ctr;
-} EVP_AES_GCM_CTX;
-#endif
 
 static bool cfg_do_ktls;
 static bool cfg_do_splice;
@@ -102,7 +72,7 @@ static SSL_CTX * setup_tls(void)
 	SSL_library_init();
 	SSL_load_error_strings();
 
-	ctx = SSL_CTX_new(SSLv23_server_method());
+	ctx = SSL_CTX_new(TLSv1_2_method());
 	if (!ctx)
 		error_ssl();
 
@@ -135,6 +105,98 @@ static void readwrite_tls(SSL *ssl)
 	printf("sent: %c (SSL_write)\n", msg);
 }
 
+#ifdef OPENSSL_IS_BORINGSSL
+
+struct boringssl_aesgcm128_keyblock {
+	unsigned char key_rx[TLS_CIPHER_AES_GCM_128_KEY_SIZE];
+	unsigned char key_tx[TLS_CIPHER_AES_GCM_128_KEY_SIZE];
+	unsigned char salt_rx[TLS_CIPHER_AES_GCM_128_SALT_SIZE];
+	unsigned char salt_tx[TLS_CIPHER_AES_GCM_128_SALT_SIZE];
+} __attribute__((packed));
+
+static void setup_kernel_tls(SSL *ssl, int fd, bool is_tx)
+{
+	struct tls12_crypto_info_aes_gcm_128 ci = {0};
+	struct boringssl_aesgcm128_keyblock kb;
+	unsigned char *key, *salt;
+	const SSL_CIPHER *cipher;
+	uint64_t seq;
+	int optname;
+
+	cipher = SSL_get_current_cipher(ssl);
+	if (!cipher)
+		error(1, 0, "error at SSL_get_current_cipher");
+
+	if (SSL_CIPHER_get_cipher_nid(cipher) != NID_aes_128_gcm)
+		error(1, 0, "unexpected cipher");
+
+	if (SSL_get_key_block_len(ssl) != sizeof(kb))
+		error(1, 0, "unexpected keyblock length");
+	if (SSL_generate_key_block(ssl, (void *) &kb, sizeof(kb)) != 1)
+		error(1, 0, "error at generate keyblock");
+
+	if (is_tx) {
+		seq = SSL_get_write_sequence(ssl);
+		key = kb.key_tx;
+		salt = kb.salt_tx;
+		optname = TLS_TX;
+	} else {
+		seq = SSL_get_read_sequence(ssl);
+		key = kb.key_rx;
+		salt = kb.salt_rx;
+		optname = TLS_RX;
+	}
+
+	seq = bswap_64(seq);
+
+	ci.info.version = TLS_1_2_VERSION;
+	ci.info.cipher_type = TLS_CIPHER_AES_GCM_128;
+
+	memcpy(ci.rec_seq, &seq, TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+	memcpy(ci.key, key, TLS_CIPHER_AES_GCM_128_KEY_SIZE);
+	memcpy(ci.salt, salt, TLS_CIPHER_AES_GCM_128_SALT_SIZE);
+
+	/* Explicit portion of the nonce. Can be anything. Passed along in
+	 * the TLS record XOR-ed with a counter increasing on each record.
+	 */
+	*((uint64_t *)ci.iv) = bswap_64(0xDEADBEEF);
+
+	if (setsockopt(fd, SOL_TLS, optname, &ci, sizeof(ci)))
+		error(1, errno, "setsockopt tls %cx", is_tx ? 't' : 'r');
+}
+#else
+
+/* define some openssl internals */
+#ifndef EVP_AES_GCM_CTX
+typedef struct { uint64_t val[2]; } uint128_t;
+
+struct gcm128_context {
+	uint128_t Yi,EKi,EK0,len,Xi,H;
+	uint128_t Htable[16];
+	void *gmult;
+	void *ghash;
+	unsigned int mres, ares;
+	void *block;
+	void *key;
+};
+
+typedef struct {
+	union {
+		double align;	/* essential, see with pahole */
+		AES_KEY ks;
+	} ks;
+	int key_set;
+	int iv_set;
+	GCM128_CONTEXT gcm;
+	unsigned char *iv;
+	int ivlen;
+	int taglen;
+	int iv_gen;
+	int tls_aad_len;
+	ctr128_f ctr;
+} EVP_AES_GCM_CTX;
+#endif
+
 static void setup_kernel_tls(SSL *ssl, int fd, bool is_tx)
 {
 	struct tls12_crypto_info_aes_gcm_128 ci = {0};
@@ -165,6 +227,7 @@ static void setup_kernel_tls(SSL *ssl, int fd, bool is_tx)
 	if (setsockopt(fd, SOL_TLS, optname, &ci, sizeof(ci)))
 		error(1, errno, "setsockopt tls %cx", is_tx ? 't' : 'r');
 }
+#endif
 
 static void __setup_kernel_tls(SSL *ssl, int fd)
 {
