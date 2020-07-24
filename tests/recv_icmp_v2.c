@@ -1,17 +1,4 @@
-/* Trigger and read an ICMP(v6) destination unreachable response
- *
- * Test by changing icmp(v6)_send to include this extra data. Note that
- * icmp_send expects network byte order, while icmpv6_send expects host
- * byte order.
- *
- * @@ -2348,7 +2348,7 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
- * -       icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
- * +       icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, htonl(32 << 16)); // be32
- * 
- * @@ -925,7 +925,7 @@ int __udp6_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
- * -       icmpv6_send(skb, ICMPV6_DEST_UNREACH, ICMPV6_PORT_UNREACH, 0);
- * +       icmpv6_send(skb, ICMPV6_DEST_UNREACH, ICMPV6_PORT_UNREACH, 32 << 16); // u32
- */
+/* Trigger and read an ICMP(v6) destination unreachable response */
 
 #define _GNU_SOURCE
 
@@ -23,6 +10,7 @@
 #include <linux/icmp.h>
 #include <linux/icmpv6.h>
 #include <linux/in.h>
+#include <linux/in6.h>
 #include <linux/ipv6.h>
 #include <linux/socket.h>
 #include <linux/sockios.h>
@@ -37,6 +25,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+/* include conflict with libc on __UAPI_DEF_IPV6_OPTIONS */
+#ifndef IPV6_RECVERR_RFC4884
+#define IPV6_RECVERR_RFC4884 31
+#endif
 
 struct cfg {
 	union {
@@ -80,7 +73,7 @@ static struct cfg cfg_ipv6 = {
 
 static void send_until_errconn(int fd)
 {
-	static char data[1000];
+	static char data[1400];
 	int ret;
 
 retry:
@@ -129,13 +122,10 @@ static void parse_errqueue(struct msghdr *msg, struct cfg *cfg, int len)
 			error(1, 0, "ee origin=%u type=%u code=%u",
 			      serr->ee_origin, serr->ee_type, serr->ee_code);
 
-		fprintf(stderr, "len=%u extension_off=%u ee_info=%x\n",
-			len, serr->ee_data, serr->ee_info);
-
-		fprintf(stderr, "rfc4884 len=%d flags=0x%x res=%d\n",
-				serr->ee_rfc4884.len,
-				serr->ee_rfc4884.flags,
-				serr->ee_rfc4884.reserved);
+		fprintf(stderr, "len=%u ee_info=0x%x, ee_data=0x%x rfc4884=(%u, 0x%x, %u)\n",
+			len, serr->ee_info, serr->ee_data,
+			serr->ee_rfc4884.len, serr->ee_rfc4884.flags,
+			serr->ee_rfc4884.reserved);
 	}
 }
 
@@ -165,9 +155,11 @@ static void recv_errqueue(int fd, struct cfg *cfg)
 	parse_errqueue(&msg, cfg, ret);
 }
 
-static void do_test(struct cfg *cfg, bool explicit_rfc4884)
+static void do_test(struct cfg *cfg, int level, int optname)
 {
 	int fd, val;
+
+	fprintf(stderr, "\nTEST(%d, %d, %d)\n", cfg->addr.sa_family, level, optname);
 
 	fd = socket(cfg->addr.sa_family, SOCK_DGRAM, 0);
 	if (fd == -1)
@@ -178,18 +170,16 @@ static void do_test(struct cfg *cfg, bool explicit_rfc4884)
 		       &val, sizeof(val)))
 		error(1, errno, "setsockopt recverr");
 
-	/* negative test: do not accept out of bounds value */
-	val = 2;
-	if (explicit_rfc4884 &&
-	    !setsockopt(fd, SOL_IP, IP_RECVERR_RFC4884,
-		      &val, sizeof(val)))
-		error(1, errno, "setsockopt recverr_rfc4884 val=-1");
+	if (optname) {
+		/* negative test: do not accept out of bounds value */
+		val = 2;
+		if (!setsockopt(fd, level, optname,  &val, sizeof(val)))
+			error(1, errno, "setsockopt out of bounds");
 
-	val = 1;
-	if (explicit_rfc4884 &&
-	    setsockopt(fd, SOL_IP, IP_RECVERR_RFC4884,
-		      &val, sizeof(val)))
-		error(1, errno, "setsockopt recverr_rfc4884");
+		val = 1;
+		if (setsockopt(fd, level, optname,  &val, sizeof(val)))
+			error(1, errno, "setsockopt");
+	}
 
 	if (connect(fd, &cfg->addr, cfg->addrlen))
 		error(1, errno, "connect");
@@ -199,14 +189,16 @@ static void do_test(struct cfg *cfg, bool explicit_rfc4884)
 	poll_err(fd);
 
 	recv_errqueue(fd, cfg);
-	sleep(1);
 }
 
 int main(int argc, char **argv)
 {
-	do_test(&cfg_ipv6, false);
-	do_test(&cfg_ipv4, false);
-	do_test(&cfg_ipv4, true);
+	do_test(&cfg_ipv6, 0, 0);
+	do_test(&cfg_ipv6, SOL_IPV6, IPV6_RECVERR_RFC4884);
+
+	sleep(2);
+	do_test(&cfg_ipv4, 0, 0);
+	do_test(&cfg_ipv4, SOL_IP, IP_RECVERR_RFC4884);
 
 	fprintf(stderr, "OK\n");
 	return 0;
