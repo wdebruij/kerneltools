@@ -1,0 +1,104 @@
+From 963140f95f60f58be7677f9a832796e83a4844e4 Mon Sep 17 00:00:00 2001
+From: Willem de Bruijn <willemb@google.com>
+Date: Thu, 9 Jul 2020 14:29:39 -0400
+Subject: [PATCH] hack: write icmp extension headers
+
+---
+ net/ipv4/icmp.c | 35 +++++++++++++++++++++++++++++++++++
+ net/ipv6/icmp.c | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 69 insertions(+)
+
+diff --git a/net/ipv4/icmp.c b/net/ipv4/icmp.c
+index 793aebf07c2a..fd2e7a3a9eb2 100644
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@ -379,6 +379,41 @@ static void icmp_push_reply(struct icmp_bxm *icmp_param,
+ 		__wsum csum = 0;
+ 		struct sk_buff *skb1;
+ 
++		if (icmph->type	== ICMP_DEST_UNREACH &&
++		    icmph->code == ICMP_PORT_UNREACH) {
++			int hlen;
++
++			/* skb->data at outer ip header */
++			hlen = ((unsigned char *) icmp_hdr(skb)) - skb->data;
++			hlen += sizeof(*icmph);
++
++			if (skb->len >= hlen + 128) {
++				struct icmp_extobj_hdr oh;
++				struct icmp_ext_hdr eh;
++				int elen, off;
++
++				elen = sizeof(eh) + sizeof(oh);
++
++				if ((skb->len - hlen) % 4 == 0) {
++					memset(&eh, 0, sizeof(eh));
++					eh.version = 2;
++
++					oh.length = ntohs(sizeof(oh));
++					oh.class_num = 1;
++					oh.class_type = 1;
++
++					off = skb->len - hlen - elen;
++					icmp_param->data.icmph.un.reserved[1] = off / sizeof(u32);
++
++					skb->csum = csum_block_sub(skb->csum, skb_checksum(skb, skb->len - elen, elen, 0), 0);
++					skb_store_bits(skb, skb->len - elen, &eh, sizeof(eh));
++					skb_store_bits(skb, skb->len - sizeof(oh), &oh, sizeof(oh));
++					skb->csum = csum_block_add(skb->csum, skb_checksum(skb, skb->len - elen, elen, 0), 0);
++				}
++
++			}
++		}
++
+ 		skb_queue_walk(&sk->sk_write_queue, skb1) {
+ 			csum = csum_add(csum, skb1->csum);
+ 		}
+diff --git a/net/ipv6/icmp.c b/net/ipv6/icmp.c
+index a4e4912ad607..4ee7cebfe806 100644
+--- a/net/ipv6/icmp.c
++++ b/net/ipv6/icmp.c
+@@ -280,6 +280,40 @@ void icmpv6_push_pending_frames(struct sock *sk, struct flowi6 *fl6,
+ 	memcpy(icmp6h, thdr, sizeof(struct icmp6hdr));
+ 	icmp6h->icmp6_cksum = 0;
+ 
++		if (icmp6h->icmp6_type == ICMPV6_DEST_UNREACH &&
++		    icmp6h->icmp6_code == ICMPV6_PORT_UNREACH) {
++			int hlen;
++
++			/* skb->data at outer ip header */
++			hlen = ((unsigned char *) icmp6_hdr(skb)) - skb->data;
++			hlen += sizeof(*icmp6h);
++
++			if (skb->len >= hlen + 128) {
++				struct icmp_extobj_hdr oh;
++				struct icmp_ext_hdr eh;
++				int elen, off;
++
++				elen = sizeof(eh) + sizeof(oh);
++
++				if ((skb->len - hlen) % 8 == 0) {
++					memset(&eh, 0, sizeof(eh));
++					eh.version = 2;
++
++					oh.length = ntohs(sizeof(oh));
++					oh.class_num = 1;
++					oh.class_type = 1;
++
++					off = skb->len - hlen - elen;
++					icmp6h->icmp6_datagram_len = off / sizeof(u64);
++
++					skb->csum = csum_block_sub(skb->csum, skb_checksum(skb, skb->len - elen, elen, 0), 0);
++					skb_store_bits(skb, skb->len - elen, &eh, sizeof(eh));
++					skb_store_bits(skb, skb->len - sizeof(oh), &oh, sizeof(oh));
++					skb->csum = csum_block_add(skb->csum, skb_checksum(skb, skb->len - elen, elen, 0), 0);
++				}
++
++			}
++		}
+ 	if (skb_queue_len(&sk->sk_write_queue) == 1) {
+ 		skb->csum = csum_partial(icmp6h,
+ 					sizeof(struct icmp6hdr), skb->csum);
+-- 
+2.28.0.rc0.142.g3c755180ce-goog
+
