@@ -13,9 +13,9 @@
  * normal:  latency of traffic shaping from protocol layer to dev:
  *          this subtracts a tstamp in packetsock on dev (eth0)
  *          from a tstamp in the ip layer at iptables NFLOG
- * bonding: latency of traffic shaping on bonding slaves:
+ * bonding: latency of traffic shaping on bonding lowerdevs:
  *          this reads packets on every device, sees the same
- *          on both master (e.g., bond0) and slaves.
+ *          on both bonding device (e.g., bond0) and lowerdevs.
  *
  * Testing:
  * verified correctness by adding delay at the relevant traffic
@@ -376,7 +376,7 @@ usage(const char *filepath)
 	fprintf(stderr, "usage: %s [-bdfFhqvx] [-c count] [-i iface] [-l loglen] [-L tbllen] [-t ival]\n"
 			"\n"
 			"where\n"
-			"  -b sets bonded mode: latency in slave device tc\n"
+			"  -b sets bonded mode: latency in lower device tc\n"
 			"  -c sets capture queue length (in packets)\n"
 			"  -d debug mode, displays individual records\n"
 			"  -f filter by TOS bits (pass as base 10 or 16)\n"
@@ -532,8 +532,8 @@ static void __main(void)
 	 * in bond mode, get timestamp at bond0 and eth0 dequeue.
 	 *
 	 * filter psock on eth0 if calculating latency from ip to eth0.
-	 * else, do not filter to read packet on both master and slave,
-	 * but disable nflog.
+	 * else, do not filter to read packet on both bonding and lower
+	 * dev, but disable nflog.
 	 */
 	if (bond_mode) {
 		logfd = -1;
