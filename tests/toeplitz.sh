@@ -19,7 +19,7 @@
 #
 # extended toeplitz test: test rxhash plus rss mapping from rxhash to rx queue.
 #
-# invoke as ./toeplitz.sh <dev> <irq-prefix>
+# invoke as ./toeplitz.sh -dev <dev> -irqprefix <irq_prefix> [-u|-t] [-4|-6]
 #
 # then generate traffic from another host to this host
 # e.g., for i in `seq 10`; do echo "ping $i" | nc -w 0 -6 -u ${HOST} 8000; sleep 0.02; done
@@ -29,8 +29,10 @@
 IPVER=-6
 PROTO=-u
 DPORT=8000
+DEV=""
+IRQ_PREFIX=""
 
-set -eu
+set -e
 
 # Return a list of the receive irq handler cpus
 get_rx_irq_cpus() {
@@ -90,20 +92,43 @@ die() {
 	exit 1
 }
 
+show_usage_and_die() {
+	echo "Usage: $0 -dev <dev> -irqprefix <irq_prefix> \\"
+	echo "  [-u|-t] [-4|-6]"
+	die "ex: $0 -dev eth0 -irqprefix eth0-rx- -u -6"
+}
+
 check_nic_rxhash_enabled() {
 	local -r pattern="receive-hashing:\ on"
 
 	ethtool -k "${DEV}" | grep -q "${pattern}" || die "rxhash must be enabled"
 }
 
-if [[ "$#" != "2" ]]; then
-	echo "Usage: $0 [dev] [irq-prefix]"
-	echo "   ex: $0 eth0 eth0-rx-"
-	exit 1
-fi
+parse_opts() {
+	while [[ "$1" =~ "-" ]]; do
+		if [[ "$1" = "-dev" ]]; then
+			shift
+			DEV="$1"
+		elif [[ "$1" = "-irqprefix" ]]; then
+			shift
+			IRQ_PREFIX="$1"
+		elif [[ "$1" = "-u" || "$1" = "-t" ]]; then
+			PROTO="$1"
+		elif [[ "$1" = "-4" || "$1" = "-6" ]]; then
+			IPVER="$1"
+		else
+			show_usage_and_die
+		fi
+		shift
+	done
 
-DEV=$1
-IRQ_PREFIX=$2
+	if [[ -z "${DEV}" || -z "${IRQ_PREFIX}" ]]; then
+		echo "Must specify both -dev and -irqprefix"
+		show_usage_and_die
+	fi
+}
+
+parse_opts $@
 RSS_KEY=$(</proc/sys/net/core/netdev_rss_key)
 
 check_rpsrfs_disabled
