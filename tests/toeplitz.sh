@@ -19,7 +19,8 @@
 #
 # extended toeplitz test: test rxhash plus rss mapping from rxhash to rx queue.
 #
-# invoke as ./toeplitz.sh -dev <dev> -irqprefix <irq_prefix> [-u|-t] [-4|-6]
+# invoke as:
+# ./toeplitz.sh -dev <dev> [-u|-t] [-4|-6] [-irqprefix <irq_prefix>]
 #
 # then generate traffic from another host to this host
 # e.g., for i in `seq 10`; do echo "ping $i" | nc -w 0 -6 -u ${HOST} 8000; sleep 0.02; done
@@ -84,7 +85,6 @@ check_rpsrfs_disabled() {
 			exit 1
 		fi
 	fi
-
 }
 
 die() {
@@ -93,9 +93,9 @@ die() {
 }
 
 show_usage_and_die() {
-	echo "Usage: $0 -dev <dev> -irqprefix <irq_prefix> \\"
-	echo "  [-u|-t] [-4|-6]"
-	die "ex: $0 -dev eth0 -irqprefix eth0-rx- -u -6"
+	echo "Usage: $0 -dev <dev> [-u|-t] [-4|-6] \\"
+	echo "  [-irqprefix <irq_prefix>]"
+	die "ex: $0 -dev eth0 -u -6 -irqprefix eth0-rx-"
 }
 
 check_nic_rxhash_enabled() {
@@ -122,8 +122,8 @@ parse_opts() {
 		shift
 	done
 
-	if [[ -z "${DEV}" || -z "${IRQ_PREFIX}" ]]; then
-		echo "Must specify both -dev and -irqprefix"
+	if [[ -z "${DEV}" ]]; then
+		echo "Must specify -dev"
 		show_usage_and_die
 	fi
 }
@@ -131,9 +131,13 @@ parse_opts() {
 parse_opts $@
 RSS_KEY=$(</proc/sys/net/core/netdev_rss_key)
 
-check_rpsrfs_disabled
 check_nic_rxhash_enabled
 
-./toeplitz "${IPVER}" "${PROTO}" -d "${DPORT}" -i "${DEV}" \
-	-k "${RSS_KEY}" -T 1000 -C "$(get_rx_irq_cpus)" -s -v
-
+if [[ ! -z "${IRQ_PREFIX}" ]]; then
+	check_rpsrfs_disabled
+	./toeplitz "${IPVER}" "${PROTO}" -d "${DPORT}" -i "${DEV}" \
+	  -k "${RSS_KEY}" -T 1000 -C "$(get_rx_irq_cpus)" -s -v
+else
+	./toeplitz "${IPVER}" "${PROTO}" -d "${DPORT}" -i "${DEV}" \
+	  -k "${RSS_KEY}" -T 1000 -s -v
+fi
