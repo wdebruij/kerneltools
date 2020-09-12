@@ -22,12 +22,20 @@
  * 2. Compute the rx_hash in software based on the packet contents
  * 3. Compare the two
  *
- * Optionally, if '-C $rx_irq_cpu_list' is given, also
+ * Optionally, either '-C $rx_irq_cpu_list' or '-r $rps_bitmap' may be given.
+ *
+ * If '-C $rx_irq_cpu_list' is given, also
  *
  * 4. Identify the cpu on which the packet arrived with PACKET_FANOUT_CPU
  * 5. Compute the rxqueue that RSS would select based on this rx_hash
  * 6. Using the $rx_irq_cpu_list map, identify the arriving cpu based on rxq irq
  * 7. Compare the cpus from 4 and 6
+ *
+ * Else if '-r $rps_bitmap' is given, also
+ *
+ * 4. Identify the cpu on which the packet arrived with PACKET_FANOUT_CPU
+ * 5. Compute the cpu that RPS should select based on rx_hash and $rps_bitmap
+ * 6. Compare the cpus from 4 and 5
  */
 
 #define _GNU_SOURCE
@@ -70,13 +78,16 @@
 
 #define FOUR_TUPLE_MAX_LEN	((sizeof(struct in6_addr) * 2) + (sizeof(uint16_t) * 2))
 
-#define MAX_CPUS 256		/* real constraint is PACKET_FANOUT_MAX */
+#define RSS_MAX_CPUS 256	/* real constraint is PACKET_FANOUT_MAX */
+
+#define RPS_MAX_CPUS 16UL	/* must be a power of 2 */
 
 /* configuration options (cmdline arguments) */
 static uint16_t cfg_dport =	8000;
 static int cfg_family =		AF_INET6;
 static char *cfg_ifname =	"eth0";
 static int cfg_num_queues;
+static int cfg_num_rps_cpus;
 static bool cfg_sink;
 static int cfg_type =		SOCK_STREAM;
 static int cfg_timeout_msec =	1000;
@@ -101,9 +112,10 @@ struct ring_state {
 	int cpu;
 };
 
-static unsigned int rx_irq_cpus[MAX_CPUS];	/* map from rxq to cpu */
+static unsigned int rx_irq_cpus[RSS_MAX_CPUS];	/* map from rxq to cpu */
+static int rps_silo_to_cpu[RPS_MAX_CPUS];
 static unsigned char toeplitz_key[TOEPLITZ_KEY_MAX_LEN];
-static struct ring_state rings[MAX_CPUS];
+static struct ring_state rings[RSS_MAX_CPUS];
 
 static inline uint32_t toeplitz(const unsigned char *four_tuple,
 				const unsigned char *key)
@@ -135,7 +147,18 @@ static void verify_rss(uint32_t rx_hash, int cpu)
 
 	log_verbose(" rxq %d (cpu %d)", queue, rx_irq_cpus[queue]);
 	if (rx_irq_cpus[queue] != cpu) {
-		log_verbose(". error: cpu mismatch (%d)", cpu);
+		log_verbose(". error: rss cpu mismatch (%d)", cpu);
+		frames_error++;
+	}
+}
+
+static void verify_rps(uint64_t rx_hash, int cpu)
+{
+	int silo = (rx_hash * cfg_num_rps_cpus) >> 32;
+
+	log_verbose(" silo %d (cpu %d)", silo, rps_silo_to_cpu[silo]);
+	if (rps_silo_to_cpu[silo] != cpu) {
+		log_verbose(". error: rps cpu mismatch (%d)", cpu);
 		frames_error++;
 	}
 }
@@ -165,6 +188,8 @@ static void verify_rxhash(char *pkt, uint32_t rx_hash, int cpu)
 	log_verbose("cpu %d: rx_hash 0x%08x", cpu, rx_hash);
 	if (cfg_num_queues)
 		verify_rss(rx_hash, cpu);
+	else if (cfg_num_rps_cpus)
+		verify_rps(rx_hash, cpu);
 	log_verbose("\n");
 }
 
@@ -388,6 +413,14 @@ static void show_cpulist(void)
 		fprintf(stderr, "rxq %d: cpu %d\n", i, rx_irq_cpus[i]);
 }
 
+static void show_silos(void)
+{
+	int i;
+
+	for (i = 0; i < cfg_num_rps_cpus; i++)
+		fprintf(stderr, "silo %d: cpu %d\n", i, rps_silo_to_cpu[i]);
+}
+
 static void parse_toeplitz_key(char *str, int slen, unsigned char *key)
 {
 	int i, ret, off;
@@ -401,6 +434,22 @@ static void parse_toeplitz_key(char *str, int slen, unsigned char *key)
 		if (ret != 1)
 			error(1, 0, "parse error at key index %d off %d len %d\n", i, off, slen);
 	}
+}
+
+static void parse_rps_bitmap(const char *arg)
+{
+	unsigned long bitmap;
+	int i;
+
+	bitmap = strtoul(arg, NULL, 0);
+
+	if (bitmap & ~(RPS_MAX_CPUS - 1))
+		error(1, 0, "rps bitmap 0x%lx out of bounds 0..%lu\n",
+			    bitmap, RPS_MAX_CPUS - 1);
+
+	for (i = 0; i < RPS_MAX_CPUS; i++)
+		if (bitmap & 1UL << i)
+			rps_silo_to_cpu[cfg_num_rps_cpus++] = i;
 }
 
 static void parse_opts(int argc, char **argv)
@@ -417,12 +466,13 @@ static void parse_opts(int argc, char **argv)
 	    {"timeout",	required_argument, 0, 'T'},
 	    {"udp",	no_argument, 0, 'u'},
 	    {"verbose",	no_argument, 0, 'v'},
+	    {"rps",	required_argument, 0, 'r'},
 	    {0, 0, 0, 0}
 	};
 	bool have_toeplitz = false;
 	int index, c;
 
-	while ((c = getopt_long(argc, argv, "46C:d:i:k:stT:u:v", long_options, &index)) != -1) {
+	while ((c = getopt_long(argc, argv, "46C:d:i:k:r:stT:u:v", long_options, &index)) != -1) {
 		switch (c) {
 		case '4':
 			cfg_family = AF_INET;
@@ -443,6 +493,9 @@ static void parse_opts(int argc, char **argv)
 			parse_toeplitz_key(optarg, strlen(optarg),
 					   toeplitz_key);
 			have_toeplitz = true;
+			break;
+		case 'r':
+			parse_rps_bitmap(optarg);
 			break;
 		case 's':
 			cfg_sink = true;
@@ -470,11 +523,16 @@ static void parse_opts(int argc, char **argv)
 		error(1, 0, "Must supply rss key ('-k')");
 
 	num_cpus = get_nprocs();
-	if (num_cpus > MAX_CPUS)
-		error(1, 0, "increase MAX_CPUS");
+	if (num_cpus > RSS_MAX_CPUS)
+		error(1, 0, "increase RSS_MAX_CPUS");
 
-	if (cfg_verbose)
+	if (cfg_num_queues && cfg_num_rps_cpus)
+		error(1, 0,
+		      "Can't supply both RSS cpus ('-C') and RPS map ('-r')");
+	if (cfg_verbose) {
 		show_cpulist();
+		show_silos();
+	}
 }
 
 int main(int argc, char **argv)
