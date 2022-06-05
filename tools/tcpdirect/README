@@ -1,0 +1,31 @@
+README for tcpdirect
+
+Very rough proof-of-concept only.
+
+Steps on the tcpdirect receiver:
+
+    modprobe nvidia
+    modprobe nv_p2pdma
+
+    # allocate with CUDA and pass to kernel nv_p2pdma provider
+    ./nvdmad 0000:0a:00.0
+    echo "wait until 'Up. Device p2pdma pool ready. [...]'"
+
+    # reduce RSS to queues [0..N), to dedicate queue N to tcpdirect
+    ethtool --rxfh eth1 equal 4
+    echo 0a:00.0 > /sys/class/net/eth0/queues/rx-4/p2pdma_provider
+
+    # bring link down and up to reallocate rxq buffers
+    ethtool -G eth1 rx 512
+
+    # steer tcpdirect traffic to queue N
+    ethtool -K eth1 ntuple on
+    ethtool --config-ntuple eth1 flow-type tcp4 dst-port 8000 action 4
+
+    ./recv_test -t -v -R
+
+And on another host as sender
+
+    ./send_tcp -4 -D ${HOST} -s 1000 -n 4 -I 10
+
+For use with https://github.com/wdebruij/linux/tree/tcpdirect-5.15-1
